@@ -4,7 +4,7 @@ use statrs::statistics::{Data, Distribution, Max, OrderStatistics};
 use std::collections::{HashSet};
 use std::env;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc};
 use std::time::Instant;
 use async_channel::Sender;
 use dashmap::{DashMap};
@@ -165,14 +165,14 @@ fn common_fields(
 }
 
 fn compute_metrics(
-    value_bytes: &[u8],
+    total_size: usize,
     signed: &SignedBlock,
     author_to_ref_map: &mut Arc<DashMap<AuthorityIndex, HashSet<AuthorityIndex>>>,
     tx_tracker: &mut Arc<DashMap<u32, (u32, Vec<Vec<u8>>)>>,
+    size: usize
 ) -> BlockMetrics {
     let (round, author, ancestors, transactions, version) = common_fields(&signed.inner);
 
-    let total_size = value_bytes.len();
     let num_references = ancestors.len() as u32;
     let reference_byte_size = (num_references as usize) * (32 + 4 + 4); // fixed 40 bytes/ref
 
@@ -195,10 +195,10 @@ fn compute_metrics(
         entry.1.clear(); // reuse allocation instead of a fresh Vec
     }
 
-    //let mut bitmap = RoaringBitmap::default();
-    //for author in auths.iter() {
-    //    bitmap.insert(*author);
-    //}
+    let mut bitmap = RoaringBitmap::from_iter((0..total_size).map(|_| 1));
+    for author in auths.iter() {
+        bitmap.remove(*author);
+    }
 
     author_to_ref_map.insert(author, auths);
 
@@ -227,8 +227,7 @@ fn compute_metrics(
         overlap,
         round: round,
         per_tx_size,
-        //bitmap_size: bitmap.serialized_size() as u32,
-        bitmap_size: 0
+        bitmap_size: bitmap.iter().s as u32,
     }
 }
 
@@ -309,10 +308,15 @@ fn load_from_path(db_path: PathBuf, task_sender: Sender<Vec<u8>>) {
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = env::args().collect();
+    println!("all args: {:?}", args);
+    let slot: usize = args.get(1).unwrap().parse().unwrap();
+    let size: usize = args.get(2).unwrap().parse().unwrap();
+
     let db_path = env::home_dir()
         .unwrap()
         .as_path()
-        .join("Downloads/opt/sui/db/consensus_db/1230"); // 648 1230
+        .join(format!("Downloads/opt/sui/db/consensus_db/{slot}"));
 
     let max_round: u32 = 1_000_000;
     let limit: usize = max_round as usize * 108;
@@ -337,18 +341,16 @@ async fn main() {
     let (task_sender, task_receiver) = async_channel::bounded(1000);
     load_from_path(db_path, task_sender);
 
-    let (block_sender, mut block_receiver) = mpsc::channel(1000);
-    for _ in 0..10 {
+    let (block_sender, mut block_receiver) = async_channel::bounded(1000);
+    for _ in 0..4 {
         let block_sender = block_sender.clone();
         let task_receiver = task_receiver.clone();
-        let mut author_to_ref_map = author_to_ref_map.clone();
-        let mut tx_tracker = tx_tracker.clone();
 
         tokio::spawn(async move {
             while let Ok(value) = task_receiver.recv().await {
                 match parse_block_value(&value) {
                     Ok(signed) => {
-                        let _ = block_sender.send(compute_metrics(&value, &signed, &mut author_to_ref_map, &mut tx_tracker)).await;
+                        let _ = block_sender.send((signed, value.len())).await;
                     }
                     Err(e) => {
                         eprintln!(
@@ -363,8 +365,24 @@ async fn main() {
     }
     drop(block_sender);
 
+    let (block_sender2, mut block_receiver2) = mpsc::channel(1000);
+    for _ in 0..4 {
+        let block_sender = block_sender2.clone();
+        let task_receiver = block_receiver.clone();
+        let mut author_to_ref_map = author_to_ref_map.clone();
+        let mut tx_tracker = tx_tracker.clone();
+        let size_clone = size.clone();
+
+        tokio::spawn(async move {
+            while let Ok((signed, len)) = task_receiver.recv().await {
+                let _ = block_sender.send(compute_metrics(len, &signed, &mut author_to_ref_map, &mut tx_tracker, size_clone)).await;
+            }
+        });
+    }
+    drop(block_sender2);
+
     let mut reported = 0;
-    while let Some(m) = block_receiver.recv().await {
+    while let Some(m) = block_receiver2.recv().await {
         block_size.push(m.total_size_kb);
         num_tx.push(m.num_transactions as f64);
         act_num_tx.push(m.act_num_transactions as f64);
