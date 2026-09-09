@@ -1,0 +1,23 @@
+[package]
+name = "consensus_stats"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "consensus_stats"
+path = "src/main.rs"
+
+[dependencies]
+rocksdb = { version = "0.24"}
+bcs = "0.2.1"
+serde = { version = "1.0.229", features = ["derive"] }
+statrs = "0.18.0"
+tokio = { version = "1.53.0", features = ["full"] }
+async-channel = "2.5.0"
+dashmap = "7.0.0-rc2"
+tidehunter = { git = "https://github.com/MystenLabs/tidehunter" }
+roaring = "0.11.5"
+
+[profile.release]
+opt-level = 3
+lto = true

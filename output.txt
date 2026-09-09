@@ -1,0 +1,18 @@
+block_size (KB):             mean=4.113  p1=3.332 p10=3.723 p50=4.074  p90=4.445  p99=5.598
+num_transactions:      mean=0.333 p1=0.000 p10=0.000 p50=0.000  p90=1.000  p99=2.000
+tx_payload_size_per_block (KB):          mean=144.002
+tx_size:        mean=399.900  p1=298.000 p10=298.000 p50=306.000  p90=580.000  p99=2023.000
+num_references:        mean=98.363  p1=81.000 p10=91.000 p50=99.000  p90=104.000  p99=106.000 max=108.000
+references_size (KB):  mean=3.842
+% of total:            mean=0.93971 p1=0.692 p10=0.898 p50=0.966  p90=0.969  p99=0.970
+overlap:               mean=13.877
+
+
+block_size (KB):             mean=4.113  p1=3.332 p10=3.723 p50=4.074  p90=4.445  p99=5.598
+num_transactions:      mean=0.333 p1=0.000 p10=0.000 p50=0.000  p90=1.000  p99=2.000
+tx_payload_size_per_block (KB):          mean=144.002
+tx_size:        mean=399.900  p1=298.000 p10=298.000 p50=306.000  p90=580.000  p99=2023.000
+num_references:        mean=98.363  p1=81.000 p10=91.000 p50=99.000  p90=104.000  p99=106.000 max=108.000
+references_size (KB):  mean=3.842
+% of total:            mean=0.93971 p1=0.692 p10=0.898 p50=0.966  p90=0.969  p99=0.970
+overlap:               mean=13.877
