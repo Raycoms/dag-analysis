@@ -227,7 +227,7 @@ fn compute_metrics(
         overlap,
         round: round,
         per_tx_size,
-        bitmap_size: bitmap.iter().s as u32,
+        bitmap_size: bitmap.serialized_size() as u32,
     }
 }
 
