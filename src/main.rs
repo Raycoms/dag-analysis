@@ -140,7 +140,8 @@ struct BlockMetrics {
     overlap: i64,
     round: u32,
     per_tx_size: u32,
-    bitmap_size: u32
+    bitmap_size: u32,
+    act_num_transactions: u32,
 }
 
 /// Pulls the fields common to all three Block versions out through a single
@@ -167,6 +168,7 @@ fn compute_metrics(
     value_bytes: &[u8],
     signed: &SignedBlock,
     author_to_ref_map: &mut Arc<DashMap<AuthorityIndex, HashSet<AuthorityIndex>>>,
+    tx_tracker: &mut Arc<DashMap<u32, (u32, Vec<Vec<u8>>)>>,
 ) -> BlockMetrics {
     let (round, author, ancestors, transactions, version) = common_fields(&signed.inner);
 
@@ -184,14 +186,32 @@ fn compute_metrics(
         -1
     };
 
-    let mut bitmap = RoaringBitmap::default();
-    for author in auths.iter() {
-        bitmap.insert(*author);
+    let mut dup_tx = 0;
+    let mut entry = tx_tracker.entry(round % 10).or_insert_with(|| (round, Vec::new()));
+
+    // stale bucket from a previous round that hashed to the same slot
+    if entry.0 != round {
+        entry.0 = round;
+        entry.1.clear(); // reuse allocation instead of a fresh Vec
     }
+
+    //let mut bitmap = RoaringBitmap::default();
+    //for author in auths.iter() {
+    //    bitmap.insert(*author);
+    //}
 
     author_to_ref_map.insert(author, auths);
 
     let total_tx_payload_bytes: u64 = transactions.iter().map(|t| t.data.len() as u64).sum();
+
+    for tx in transactions.iter() {
+        if entry.1.contains(&tx.data) {
+            dup_tx += 1;
+        } else {
+            entry.1.push(tx.data.clone());
+        }
+    }
+
     let mut per_tx_size: u32 = 0;
     if transactions.len() > 0 {
         per_tx_size = (total_tx_payload_bytes / transactions.len() as u64) as u32;
@@ -202,11 +222,13 @@ fn compute_metrics(
         num_references,
         references_size_kb: reference_byte_size as f64 / 1024.0,
         num_transactions: transactions.len() as u32,
+        act_num_transactions: (transactions.len() - dup_tx) as u32,
         payload_size_kb: total_tx_payload_bytes as f64,
         overlap,
         round: round,
         per_tx_size,
-        bitmap_size: bitmap.serialized_size() as u32,
+        //bitmap_size: bitmap.serialized_size() as u32,
+        bitmap_size: 0
     }
 }
 
@@ -224,7 +246,6 @@ fn stats_summary(xs: &[f64]) -> (f64, f64, f64, f64, f64, f64, f64) {
 
 fn load_from_path(db_path: PathBuf, task_sender: Sender<Vec<u8>>) {
     tokio::spawn(async move {
-        // --- Attempt 1: Try reading via RocksDB ---
         let mut opts = Options::default();
         opts.create_if_missing(false);
 
@@ -297,9 +318,12 @@ async fn main() {
     let limit: usize = max_round as usize * 108;
 
     let author_to_ref_map: Arc<DashMap<AuthorityIndex, HashSet<AuthorityIndex>>> = Arc::new(DashMap::new());
+    let tx_tracker: Arc<DashMap<u32, (u32, Vec<Vec<u8>>)>> = Arc::new(DashMap::new());
 
     let mut block_size = Vec::with_capacity(limit);
     let mut num_tx = Vec::with_capacity(limit);
+    let mut act_num_tx = Vec::with_capacity(limit);
+
     let mut tx_payload_size_per_block = Vec::with_capacity(limit);
     let mut num_references = Vec::with_capacity(limit);
     let mut reference_size = Vec::with_capacity(limit);
@@ -314,15 +338,17 @@ async fn main() {
     load_from_path(db_path, task_sender);
 
     let (block_sender, mut block_receiver) = mpsc::channel(1000);
-    for _ in 0..8 {
+    for _ in 0..10 {
         let block_sender = block_sender.clone();
         let task_receiver = task_receiver.clone();
         let mut author_to_ref_map = author_to_ref_map.clone();
+        let mut tx_tracker = tx_tracker.clone();
+
         tokio::spawn(async move {
             while let Ok(value) = task_receiver.recv().await {
                 match parse_block_value(&value) {
                     Ok(signed) => {
-                        let _ = block_sender.send(compute_metrics(&value, &signed, &mut author_to_ref_map)).await;
+                        let _ = block_sender.send(compute_metrics(&value, &signed, &mut author_to_ref_map, &mut tx_tracker)).await;
                     }
                     Err(e) => {
                         eprintln!(
@@ -341,6 +367,7 @@ async fn main() {
     while let Some(m) = block_receiver.recv().await {
         block_size.push(m.total_size_kb);
         num_tx.push(m.num_transactions as f64);
+        act_num_tx.push(m.act_num_transactions as f64);
         num_references.push(m.num_references as f64);
         reference_size.push(m.references_size_kb);
         reference_pct.push(m.references_size_kb / m.total_size_kb);
@@ -365,6 +392,8 @@ async fn main() {
     println!();
     let (size_mean, size_p1, size_p10, size_p50, size_p90, size_p99, size_max) = stats_summary(&block_size);
     let (tx_mean, tx1, tx10, tx_p50, tx_p90, tx_p99, tx_max) = stats_summary(&num_tx);
+    let (act_tx_mean, act_tx1, act_tx10, act_tx_p50, act_tx_p90, act_tx_p99, act_tx_max) = stats_summary(&act_num_tx);
+
     let (ref_mean, ref1, ref10, ref_p50, ref_p90, ref_p99, ref_max) = stats_summary(&num_references);
     let (ref_size_mean, ref_size_1, ref_size_10, ref_size_50, ref_size_90, ref_size_99, ref_size_max) = stats_summary(&reference_size);
     let (ref_pct_mean, ref_pct_1, ref_pct_10, ref_pct_50, ref_pct_90, ref_pct_99, ref_pct_max) = stats_summary(&reference_pct);
@@ -380,6 +409,10 @@ async fn main() {
     println!(
         "num_transactions:      mean={:.3} p1={:.3} p10={:.3} p50={:.3}  p90={:.3}  p99={:.3}",
         tx_mean, tx1, tx10, tx_p50, tx_p90, tx_p99
+    );
+    println!(
+        "actual num_transactions:      mean={:.3} p1={:.3} p10={:.3} p50={:.3}  p90={:.3}  p99={:.3}",
+        act_tx_mean, act_tx1, act_tx10, act_tx_p50, act_tx_p90, act_tx_p99
     );
     println!("tx_payload_size_per_block (KB):          mean={:.3}", tx_payload_size);
     println!(
