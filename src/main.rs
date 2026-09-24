@@ -1,175 +1,30 @@
+mod datatypes;
+mod utils;
+
 use rocksdb::{Options, DB};
 use serde::Deserialize;
 use statrs::statistics::{Data, Distribution, Max, OrderStatistics};
-use std::collections::{HashSet};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc};
 use std::time::Instant;
 use async_channel::Sender;
-use dashmap::{DashMap};
 use roaring::RoaringBitmap;
 use tidehunter;
 use tidehunter::config::Config;
 use tidehunter::db::{Db};
 use tidehunter::metrics::Metrics;
 use tokio::sync::mpsc;
-
-type Round = u32;
-type AuthorityIndex = u32;
-type Epoch = u64;
-type BlockTimestampMs = u64;
-type CommitIndex = u32;
-type TransactionIndex = u16;
-
-#[derive(Deserialize, Clone, Copy)]
-struct BlockDigest([u8; 32]);
-
-#[derive(Deserialize, Clone, Copy)]
-struct BlockRef {
-    round: Round,
-    author: AuthorityIndex,
-    digest: BlockDigest,
-}
-
-#[derive(Deserialize)]
-struct Transaction {
-    data: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-struct CommitDigest([u8; 32]);
-
-#[derive(Deserialize)]
-struct CommitVote {
-    index: CommitIndex,
-    digest: CommitDigest,
-}
-
-#[derive(Deserialize)]
-enum MisbehaviorProof {
-    InvalidBlock(#[allow(dead_code)] BlockRef),
-}
-
-#[derive(Deserialize)]
-struct MisbehaviorReport {
-    target: AuthorityIndex,
-    proof: MisbehaviorProof,
-}
-
-#[derive(Deserialize)]
-struct BlockTransactionVotes {
-    #[allow(dead_code)]
-    block_ref: BlockRef,
-    #[allow(dead_code)]
-    rejects: Vec<TransactionIndex>,
-}
-
-#[derive(Deserialize)]
-struct BlockV1 {
-    epoch: Epoch,
-    round: Round,
-    author: AuthorityIndex,
-    timestamp_ms: BlockTimestampMs,
-    ancestors: Vec<BlockRef>,
-    transactions: Vec<Transaction>,
-    commit_votes: Vec<CommitVote>,
-    misbehavior_reports: Vec<MisbehaviorReport>,
-}
-
-#[derive(Deserialize)]
-struct BlockV2 {
-    epoch: Epoch,
-    round: Round,
-    author: AuthorityIndex,
-    #[allow(dead_code)]
-    timestamp_ms: BlockTimestampMs,
-    ancestors: Vec<BlockRef>,
-    transactions: Vec<Transaction>,
-    #[allow(dead_code)]
-    transaction_votes: Vec<BlockTransactionVotes>,
-    #[allow(dead_code)]
-    commit_votes: Vec<CommitVote>,
-    #[allow(dead_code)]
-    misbehavior_reports: Vec<MisbehaviorReport>,
-}
-
-#[derive(Deserialize)]
-struct BlockV3 {
-    epoch: Epoch,
-    round: Round,
-    author: AuthorityIndex,
-    #[allow(dead_code)]
-    timestamp_ms: BlockTimestampMs,
-    ancestors: Vec<BlockRef>,
-    transactions: Vec<Transaction>,
-    #[allow(dead_code)]
-    transaction_votes: Vec<BlockTransactionVotes>,
-    #[allow(dead_code)]
-    transaction_votes_cutoff_round: Round,
-    #[allow(dead_code)]
-    commit_votes: Vec<CommitVote>,
-    #[allow(dead_code)]
-    misbehavior_reports: Vec<MisbehaviorReport>,
-}
-
-#[derive(Deserialize)]
-enum Block {
-    V1(BlockV1),
-    V2(BlockV2),
-    V3(BlockV3),
-}
-
-#[derive(Deserialize)]
-struct SignedBlock {
-    inner: Block,
-    signature: Vec<u8>,
-}
-
-fn parse_block_value(value_bytes: &[u8]) -> bcs::Result<SignedBlock> {
-    let inner_bytes: Vec<u8> = bcs::from_bytes(value_bytes)?;
-    bcs::from_bytes(&inner_bytes)
-}
-
-struct BlockMetrics {
-    total_size_kb: f64,
-    num_references: u32,
-    references_size_kb: f64,
-    num_transactions: u32,
-    payload_size_kb: f64,
-    overlap: i64,
-    round: u32,
-    per_tx_size: u32,
-    bitmap_size: u32,
-    act_num_transactions: u32,
-}
-
-/// Pulls the fields common to all three Block versions out through a single
-/// match, so the metrics logic below doesn't need to be duplicated per
-/// version. (epoch/timestamp_ms aren't used in metrics currently but are
-/// included for parity with the fields available on every version.)
-fn common_fields(
-    b: &Block,
-) -> (
-    Round,
-    AuthorityIndex,
-    &Vec<BlockRef>,
-    &Vec<Transaction>,
-    &'static str,
-) {
-    match b {
-        Block::V1(b) => (b.round, b.author, &b.ancestors, &b.transactions, "V1"),
-        Block::V2(b) => (b.round, b.author, &b.ancestors, &b.transactions, "V2"),
-        Block::V3(b) => (b.round, b.author, &b.ancestors, &b.transactions, "V3"),
-    }
-}
+use crate::datatypes::*;
+use crate::utils::SharedQueue;
 
 fn compute_metrics(
     total_size: usize,
     signed: &SignedBlock,
-    author_to_ref_map: &mut Arc<DashMap<AuthorityIndex, HashSet<AuthorityIndex>>>,
-    tx_tracker: &mut Arc<DashMap<u32, (u32, Vec<Vec<u8>>)>>,
-    size: usize
+    author_to_ref_map: &mut HashMap<AuthorityIndex, HashSet<AuthorityIndex>>,
+    tx_tracker: &mut SharedQueue<Vec<u8>>,
+    validator_set_size: usize
 ) -> BlockMetrics {
     let (round, author, ancestors, transactions, version) = common_fields(&signed.inner);
 
@@ -186,16 +41,12 @@ fn compute_metrics(
         -1
     };
 
-    let mut dup_tx = 0;
-    let mut entry = tx_tracker.entry(round % 10).or_insert_with(|| (round, Vec::new()));
-
-    // stale bucket from a previous round that hashed to the same slot
-    if entry.0 != round {
-        entry.0 = round;
-        entry.1.clear(); // reuse allocation instead of a fresh Vec
+    // Roughly push twice a round.
+    if round % 10 == 0 && author % 50 == 0 {
+        tx_tracker.push(vec![]);
     }
 
-    let mut bitmap = RoaringBitmap::from_iter((0..total_size).map(|_| 1));
+    let mut bitmap = RoaringBitmap::from_iter((0..validator_set_size).map(|_| 1));
     for author in auths.iter() {
         bitmap.remove(*author);
     }
@@ -204,25 +55,33 @@ fn compute_metrics(
 
     let total_tx_payload_bytes: u64 = transactions.iter().map(|t| t.data.len() as u64).sum();
 
-    for tx in transactions.iter() {
-        if entry.1.contains(&tx.data) {
+    let tx_len = transactions.len();
+    let mut tx_vec = Vec::new();
+    let mut dup_tx = 0;
+    for tx in transactions {
+        if tx_tracker.contains(&tx.data) {
             dup_tx += 1;
-        } else {
-            entry.1.push(tx.data.clone());
+        }
+        else {
+            tx_vec.push(tx.data.clone());
         }
     }
 
+    if !tx_vec.is_empty() {
+        tx_tracker.push_items(tx_vec);
+    }
+
     let mut per_tx_size: u32 = 0;
-    if transactions.len() > 0 {
-        per_tx_size = (total_tx_payload_bytes / transactions.len() as u64) as u32;
+    if tx_len > 0 {
+        per_tx_size = (total_tx_payload_bytes / tx_len as u64) as u32;
     }
 
     BlockMetrics {
         total_size_kb: total_size as f64 / 1024.0,
         num_references,
         references_size_kb: reference_byte_size as f64 / 1024.0,
-        num_transactions: transactions.len() as u32,
-        act_num_transactions: (transactions.len() - dup_tx) as u32,
+        num_transactions: tx_len as u32,
+        act_num_transactions: (tx_len - dup_tx) as u32,
         payload_size_kb: total_tx_payload_bytes as f64,
         overlap,
         round: round,
@@ -244,7 +103,7 @@ fn stats_summary(xs: &[f64]) -> (f64, f64, f64, f64, f64, f64, f64) {
 }
 
 fn load_from_path(db_path: PathBuf, task_sender: Sender<Vec<u8>>) {
-    tokio::spawn(async move {
+    tokio::task::spawn_blocking( move || {
         let mut opts = Options::default();
         opts.create_if_missing(false);
 
@@ -260,7 +119,7 @@ fn load_from_path(db_path: PathBuf, task_sender: Sender<Vec<u8>>) {
                                     break;
                                 }
                             };
-                            let _ = task_sender.send(value.to_vec()).await;
+                            let _ = task_sender.send_blocking(value.to_vec());
                         }
                         true
                     } else {
@@ -289,7 +148,7 @@ fn load_from_path(db_path: PathBuf, task_sender: Sender<Vec<u8>>) {
                             while let Some(entry) = iter.next() {
                                 match entry {
                                     Ok((key, value)) => {
-                                        let _ = task_sender.send(value.to_vec()).await;
+                                        let _ = task_sender.send_blocking(value.to_vec());
                                     }
                                     Err(e) => {
                                         break;
@@ -312,17 +171,17 @@ async fn main() {
     println!("all args: {:?}", args);
     let slot: usize = args.get(1).unwrap().parse().unwrap();
     let size: usize = args.get(2).unwrap().parse().unwrap();
+    let cores = 4;
 
     let db_path = env::home_dir()
         .unwrap()
         .as_path()
-        .join(format!("Downloads/opt/sui/db/consensus_db/{slot}"));
+        .join(format!("Downloads/opt/sui/db/consensus_db/{slot}")); // 648(108) 1230(128)
 
     let max_round: u32 = 1_000_000;
     let limit: usize = max_round as usize * 108;
 
-    let author_to_ref_map: Arc<DashMap<AuthorityIndex, HashSet<AuthorityIndex>>> = Arc::new(DashMap::new());
-    let tx_tracker: Arc<DashMap<u32, (u32, Vec<Vec<u8>>)>> = Arc::new(DashMap::new());
+    let tx_tracker : SharedQueue<Vec<u8>>= SharedQueue::new(10);
 
     let mut block_size = Vec::with_capacity(limit);
     let mut num_tx = Vec::with_capacity(limit);
@@ -338,19 +197,27 @@ async fn main() {
 
     let start_time = Instant::now();
 
-    let (task_sender, task_receiver) = async_channel::bounded(1000);
+    let (task_sender, task_receiver) = async_channel::bounded(10000);
     load_from_path(db_path, task_sender);
 
-    let (block_sender, mut block_receiver) = async_channel::bounded(1000);
-    for _ in 0..4 {
-        let block_sender = block_sender.clone();
-        let task_receiver = task_receiver.clone();
+    let mut sender_vec = Vec::new();
+    let mut receiver_vec = Vec::new();
+    for _ in 0..cores {
+        let (sender, receiver) = mpsc::channel(10000);
+        sender_vec.push(sender);
+        receiver_vec.push(receiver);
+    }
 
+    for _ in 0..cores {
+        let channel_vec = sender_vec.clone();
+        let task_receiver = task_receiver.clone();
         tokio::spawn(async move {
             while let Ok(value) = task_receiver.recv().await {
                 match parse_block_value(&value) {
                     Ok(signed) => {
-                        let _ = block_sender.send((signed, value.len())).await;
+                        let (round, author, ancestors, transactions, version) = common_fields(&signed.inner);
+                        let index = (author % cores) as usize;
+                        let _ = channel_vec[index].send((signed, value.len())).await;
                     }
                     Err(e) => {
                         eprintln!(
@@ -363,23 +230,23 @@ async fn main() {
             }
         });
     }
-    drop(block_sender);
 
-    let (block_sender2, mut block_receiver2) = mpsc::channel(1000);
-    for _ in 0..4 {
-        let block_sender = block_sender2.clone();
-        let task_receiver = block_receiver.clone();
-        let mut author_to_ref_map = author_to_ref_map.clone();
+    let (block_sender2, mut block_receiver2) = mpsc::channel(10000);
+    for mut block_receiver in receiver_vec {
+        let block_sender2 = block_sender2.clone();
+        let mut author_to_ref_map = HashMap::new();
         let mut tx_tracker = tx_tracker.clone();
         let size_clone = size.clone();
 
         tokio::spawn(async move {
-            while let Ok((signed, len)) = task_receiver.recv().await {
-                let _ = block_sender.send(compute_metrics(len, &signed, &mut author_to_ref_map, &mut tx_tracker, size_clone)).await;
+            while let Some((signed, len)) = block_receiver.recv().await {
+                let _ = block_sender2.send(compute_metrics(len, &signed, &mut author_to_ref_map, &mut tx_tracker, size_clone)).await;
             }
         });
     }
+
     drop(block_sender2);
+    drop(sender_vec);
 
     let mut reported = 0;
     while let Some(m) = block_receiver2.recv().await {
